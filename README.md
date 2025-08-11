@@ -37,7 +37,7 @@ modprobe: ERROR: could not insert 'vmmon': Key was rejected by service
 
 ### 1. Download the script
 ```bash
-wget https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/vmware-secureboot-fix.sh
+wget https://raw.githubusercontent.com/tmap/vmware-secureboot-fix/main/vmware-secureboot-fix.sh
 chmod +x vmware-secureboot-fix.sh
 ```
 
