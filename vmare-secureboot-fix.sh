@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# vmware-secureboot-fix.sh
-# One-shot setup for VMware Workstation kernel modules under Secure Boot.
-# - Generates/stores MOK key at /root/vmware-signing
-# - Enrolls the key (requires one reboot via MOK Manager)
-# - Rebuilds vmmon/vmnet, signs them, loads them
-# - Installs a postinst hook to auto-rebuild+sign after future kernel updates
+# vmware-secureboot-fix.sh (hardened)
+# - Generates/stores MOK at /root/vmware-signing (RSA-2048; change to 3072 if desired)
+# - Enrolls key (one-time, prompts reboot)
+# - Rebuilds/signs/loads vmmon & vmnet
+# - Ensures vmmon/vmnet autoload via /etc/modules-load.d/vmware.conf
+# - Restarts VMware network services
+# - Installs kernel postinst hook to auto-rebuild+sign and restart networking
+# Security hardening:
+#   * Removed unsafe /tmp module copy fallback
+#   * Strict checks for module presence before signing/loading
 
 set -euo pipefail
 
@@ -16,161 +20,173 @@ HOOK="/etc/kernel/postinst.d/zz-vmware-sign"
 KREL="$(uname -r)"
 
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[-] Missing: $1"; exit 1; }; }
+as_root() { sudo -n true 2>/dev/null || { echo "[-] Please run with sudo: sudo $0"; exit 1; }; }
 
-echo "[*] Ensuring prerequisites..."
-sudo -n true 2>/dev/null || { echo "[-] Please run with sudo: sudo $0"; exit 1; }
+as_root
 export DEBIAN_FRONTEND=noninteractive
+echo "[*] Installing prerequisites..."
 apt-get update -y
-apt-get install -y build-essential linux-headers-"$KREL" mokutil openssl
+apt-get install -y build-essential "linux-headers-$KREL" mokutil openssl || true
 
 need_cmd vmware-modconfig
 need_cmd mokutil
 need_cmd openssl
 
-echo "[*] Creating key directory (root-only) at $KEYDIR..."
-mkdir -p "$KEYDIR"
-chmod 700 "$KEYDIR"
+echo "[*] Preparing key directory: $KEYDIR"
+install -d -m 700 "$KEYDIR"
 chown root:root "$KEYDIR"
 
 if [[ ! -f "$PRIV" || ! -f "$CERT" ]]; then
-  echo "[*] No existing MOK key found. Generating new key pair..."
+  echo "[*] Generating MOK key (RSA-2048). To use RSA-3072, edit this script."
   openssl req -new -x509 -newkey rsa:2048 \
     -keyout "$PRIV" -outform DER -out "$CERT" -nodes -days 36500 \
     -subj "/CN=${CN}/"
   chown root:root "$PRIV" "$CERT"
   chmod 600 "$PRIV"
-  echo "[+] Key generated."
+  echo "[+] Key created."
 else
   echo "[=] Using existing key at $KEYDIR"
 fi
 
-echo "[*] Checking Secure Boot state..."
+echo "[*] Secure Boot state:"
 SB_STATE="$(mokutil --sb-state 2>/dev/null || true)"
 echo "    $SB_STATE"
 
-is_enrolled() {
-  # Try to detect our cert is enrolled by subject CN match
-  mokutil --list-enrolled 2>/dev/null | grep -Fq "$CN"
-}
+is_enrolled() { mokutil --list-enrolled 2>/dev/null | grep -Fq "$CN"; }
 
 if echo "$SB_STATE" | grep -qi enabled; then
   if is_enrolled; then
-    echo "[=] Key with CN '$CN' appears already enrolled."
+    echo "[=] MOK '$CN' appears enrolled."
   else
-    echo "[*] Enrolling key with MOK. You will need to reboot once to confirm."
+    echo "[*] Enrolling key (one-time). You'll be prompted to set a password and reboot."
     mokutil --import "$CERT"
     echo
-    echo "[!] Reboot required to finish enrollment."
-    echo "    On reboot, in the blue 'MOK Manager':"
-    echo "      Enroll MOK -> Continue -> Yes -> enter the password you set -> Reboot"
-    echo
+    echo "[!] Reboot required to finish MOK enrollment."
+    echo "    Blue screen flow: Enroll MOK -> Continue -> Yes -> enter password -> Reboot"
     read -r -p "Press Enter to reboot now (recommended), or Ctrl+C to cancel: " _ || true
     reboot
     exit 0
   fi
 else
-  echo "[=] Secure Boot disabled. Signing is optional but will be set up anyway."
+  echo "[=] Secure Boot disabled; proceeding (signing still configured)."
 fi
 
-echo "[*] Rebuilding VMware modules for current kernel ($KREL)..."
-# This builds vmmon/vmnet and usually installs them under /lib/modules/.../misc
+echo "[*] Rebuilding VMware modules for kernel $KREL..."
 vmware-modconfig --console --install-all || true
 
-echo "[*] Ensuring modules are present; creating misc dir if needed..."
+echo "[*] Verifying modules exist in /lib/modules/$KREL/misc ..."
 install -d -m 755 "/lib/modules/$KREL/misc"
-
-# Fallback: if modules not staged, try copying most recent build artifacts from /tmp
 for m in vmmon vmnet; do
   KO="/lib/modules/$KREL/misc/${m}.ko"
   if [[ ! -f "$KO" ]]; then
-    echo "    [$m] Not found in /lib/modules. Searching recent build output..."
-    SRC="$(find /tmp -maxdepth 2 -type f -name "${m}.ko" -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | awk '{print $2}')"
-    if [[ -n "${SRC:-}" ]]; then
-      cp -f "$SRC" "$KO"
-    fi
+    echo "[-] $KO not found after vmware-modconfig. Aborting for safety."
+    echo "    Ensure VMware Workstation is installed and matching kernel headers are present."
+    exit 1
   fi
 done
 
 echo "[*] Signing modules for all installed kernels (if sign-file exists)..."
 for dir in /lib/modules/*; do
   [[ -d "$dir/misc" ]] || continue
-  KVER="$(basename "$dir")"
-  SIGNER="/usr/src/linux-headers-$KVER/scripts/sign-file"
-  if [[ -x "$SIGNER" ]]; then
-    for m in vmmon vmnet; do
-      KO="$dir/misc/${m}.ko"
-      if [[ -f "$KO" ]]; then
-        "$SIGNER" sha256 "$PRIV" "$CERT" "$KO" || true
-      fi
-    done
-    depmod -a "$KVER" || true
-  fi
+  KV="$(basename "$dir")"
+  SIGNER="/usr/src/linux-headers-$KV/scripts/sign-file"
+  [[ -x "$SIGNER" ]] || continue
+  for m in vmmon vmnet; do
+    KO="$dir/misc/${m}.ko"
+    [[ -f "$KO" ]] || continue
+    "$SIGNER" sha256 "$PRIV" "$CERT" "$KO" || true
+  done
+  depmod -a "$KV" || true
 done
 
-echo "[*] Loading modules for the running kernel..."
+echo "[*] Ensuring vmmon/vmnet autoload at boot..."
+CONF="/etc/modules-load.d/vmware.conf"
+grep -q '^vmmon$' "$CONF" 2>/dev/null || echo vmmon | tee -a "$CONF" >/dev/null
+grep -q '^vmnet$' "$CONF" 2>/dev/null || echo vmnet | tee -a "$CONF" >/dev/null
+
+echo "[*] Loading modules now..."
 modprobe -v vmmon || true
 modprobe -v vmnet || true
+
+echo "[*] Restarting VMware network services..."
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl restart vmware-networks.service 2>/dev/null || true
+  systemctl restart vmware.service 2>/dev/null || true
+fi
+# Fallback legacy helpers
+if command -v vmware-networks >/dev/null 2>&1; then
+  vmware-networks --restart || true
+fi
+if [ -x /etc/init.d/vmware ]; then
+  /etc/init.d/vmware restart || true
+fi
 
 echo "[*] Verifying signatures on current kernel modules:"
 for m in vmmon vmnet; do
   KO="/lib/modules/$KREL/misc/${m}.ko"
-  if [[ -f "$KO" ]]; then
-    echo "---- $KO"
-    modinfo "$KO" | grep -E 'signer|sig_key|sig_hash|vermagic' || true
-  fi
+  echo "---- $KO"
+  modinfo "$KO" | grep -E 'signer|sig_key|sig_hash|vermagic' || true
 done
 
-echo "[*] Installing post-install hook at $HOOK (auto-rebuild + auto-sign after kernel updates)..."
+echo "[*] Installing kernel postinst hook at $HOOK ..."
 cat > "$HOOK" <<'EOF'
 #!/bin/sh
-# Auto-rebuild and auto-sign VMware modules after kernel updates
+# Auto-rebuild + sign VMware modules after kernel updates, then restart networking
 set -e
 
 KEYDIR="/root/vmware-signing"
 PRIV="$KEYDIR/MOK.priv"
 CERT="$KEYDIR/MOK.der"
 
-# The kernel version being installed is handed to postinst via $1 (usually)
+# The kernel being installed is usually passed as $1; fallback to running kernel
 KVER="$1"
-if [ -z "$KVER" ]; then
-  KVER="$(uname -r)"
-fi
+[ -n "$KVER" ] || KVER="$(uname -r)"
 
-# Rebuild VMware modules (ignore errors; we'll still try to sign any present)
+# Rebuild modules
 if command -v vmware-modconfig >/dev/null 2>&1; then
   vmware-modconfig --console --install-all || true
 fi
 
-# Ensure destination exists
+# Ensure misc dir
 install -d -m 755 "/lib/modules/$KVER/misc"
 
-# Sign modules for all installed kernels (covers multiple kernels present)
+# Sign for all installed kernels (covers multiple versions)
 for dir in /lib/modules/*; do
   [ -d "$dir/misc" ] || continue
   KV="$(basename "$dir")"
   SIGNER="/usr/src/linux-headers-$KV/scripts/sign-file"
-  if [ -x "$SIGNER" ]; then
-    for m in vmmon vmnet; do
-      KO="$dir/misc/${m}.ko"
-      [ -f "$KO" ] || continue
-      if [ -f "$PRIV" ] && [ -f "$CERT" ]; then
-        "$SIGNER" sha256 "$PRIV" "$CERT" "$KO" || true
-      fi
-    done
-    /sbin/depmod -a "$KV" || true
-  fi
+  [ -x "$SIGNER" ] || continue
+  for m in vmmon vmnet; do
+    KO="$dir/misc/${m}.ko"
+    [ -f "$KO" ] || continue
+    if [ -f "$PRIV" ] && [ -f "$CERT" ]; then
+      "$SIGNER" sha256 "$PRIV" "$CERT" "$KO" || true
+    fi
+  done
+  /sbin/depmod -a "$KV" || true
 done
-EOF
 
+# Ensure autoload on boot
+CONF="/etc/modules-load.d/vmware.conf"
+grep -q '^vmmon$' "$CONF" 2>/dev/null || echo vmmon >> "$CONF"
+grep -q '^vmnet$' "$CONF" 2>/dev/null || echo vmnet >> "$CONF"
+
+# Restart VMware networking if available
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl restart vmware-networks.service 2>/dev/null || true
+  systemctl restart vmware.service 2>/dev/null || true
+fi
+if command -v vmware-networks >/dev/null 2>&1; then
+  vmware-networks --restart || true
+fi
+[ -x /etc/init.d/vmware ] && /etc/init.d/vmware restart || true
+
+exit 0
+EOF
 chmod +x "$HOOK"
 echo "[+] Hook installed."
 
 echo
 echo "[✓] Done."
-echo "    • If Secure Boot was enabled and the key was already enrolled, VMware should work now."
-echo "    • If the script asked you to reboot for MOK enrollment, run this script again after reboot to complete signing & loading."
-echo
-echo "Quick checks if anything misbehaves:"
-echo "  mokutil --sb-state"
-echo "  modinfo /lib/modules/$(uname -r)/misc/vmmon.ko | grep signer"
-echo "  dmesg -T | egrep -i 'vmmon|vmnet|verification|lockdown|denied'"
+echo "   • If this was your first time and the key wasn't enrolled, reboot to enroll via MOK Manager, then rerun this script."
+echo "   • Otherwise, VMware networking (vmnet8) should be available now."
